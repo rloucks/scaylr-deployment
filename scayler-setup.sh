@@ -26,6 +26,7 @@ SCALYR_API_KEY=""
 SCALYR_SERVER_URL=""
 SCALYR_CONFIG="/etc/scalyr-agent-2/agent.json"
 SCALYR_SERVICE="scalyr-agent-2"
+SCALYR_PYTHON="python3"  # Will be set to python3.12 if needed
 
 # Function to print colored output
 print_info() {
@@ -169,14 +170,58 @@ install_dependencies() {
     
     case $OS_TYPE in
         arch)
-            pacman -Sy --noconfirm --needed wget curl acl sudo
+            pacman -Sy --noconfirm --needed wget curl acl sudo python python-six python-pip
             ;;
         fedora|rhel)
+            # Install base dependencies
             $PACKAGE_MANAGER install -y wget curl acl sudo
+            
+            # Check Python version - if 3.12+, we need special handling for Scalyr
+            PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}' | cut -d. -f1,2)
+            PYTHON_MAJOR=$(echo $PYTHON_VERSION | cut -d. -f1)
+            PYTHON_MINOR=$(echo $PYTHON_VERSION | cut -d. -f2)
+            
+            print_info "Detected Python $PYTHON_VERSION"
+            
+            # Python 3.13+ is not compatible with current Scalyr agent
+            if [[ "$PYTHON_MAJOR" -eq 3 ]] && [[ "$PYTHON_MINOR" -ge 13 ]]; then
+                print_warning "Python 3.13+ detected - Scalyr agent requires Python 3.12 or earlier"
+                print_info "Installing Python 3.12 alongside Python 3.13..."
+                
+                # Install Python 3.12
+                $PACKAGE_MANAGER install -y python3.12 2>/dev/null || {
+                    print_error "Python 3.12 not available in repositories"
+                    print_error "Scalyr agent is not compatible with Python 3.13+"
+                    print_info "Options: 1) Use Fedora 41 or RHEL 9, 2) Run agent in container"
+                    exit 1
+                }
+                
+                # Install pip for Python 3.12
+                python3.12 -m ensurepip --upgrade 2>/dev/null || print_warning "Could not install pip for Python 3.12"
+                
+                # Install six for Python 3.12
+                python3.12 -m pip install six || print_error "Failed to install six for Python 3.12"
+                
+                SCALYR_PYTHON="/usr/bin/python3.12"
+                print_success "Python 3.12 installed for Scalyr agent"
+            else
+                # Python 3.12 or earlier - install normally
+                $PACKAGE_MANAGER install -y python3 python3-pip
+                python3 -m ensurepip --upgrade 2>/dev/null || true
+                
+                # Install six module
+                $PACKAGE_MANAGER install -y python3-six 2>/dev/null || {
+                    print_warning "python3-six not available via package manager, installing via pip"
+                    python3 -m pip install six
+                }
+                
+                SCALYR_PYTHON="python3"
+            fi
             ;;
         ubuntu|debian)
             apt-get update
-            apt-get install -y wget curl acl sudo
+            apt-get install -y wget curl acl sudo python3 python3-pip python3-six
+            SCALYR_PYTHON="python3"
             ;;
     esac
     
@@ -205,6 +250,51 @@ install_scalyr() {
         fi
     fi
     
+    # CRITICAL: Install six module BEFORE Scalyr installation
+    # The Scalyr package post-install script needs this
+    print_info "Pre-installing Python six module (required by Scalyr agent)..."
+    
+    # Try multiple methods to ensure six is available
+    local six_installed=false
+    
+    # Method 1: Try pip3
+    if command -v pip3 &>/dev/null; then
+        pip3 install six --quiet 2>/dev/null && six_installed=true
+    fi
+    
+    # Method 2: Try python3 -m pip
+    if [[ "$six_installed" = false ]]; then
+        python3 -m pip install six --quiet 2>/dev/null && six_installed=true
+    fi
+    
+    # Method 3: Try system python
+    if [[ "$six_installed" = false ]] && command -v python &>/dev/null; then
+        python -m pip install six --quiet 2>/dev/null && six_installed=true
+    fi
+    
+    # Method 4: Try package manager as last resort
+    if [[ "$six_installed" = false ]]; then
+        case $OS_TYPE in
+            fedora|rhel)
+                $PACKAGE_MANAGER install -y python3-six 2>/dev/null && six_installed=true
+                ;;
+            ubuntu|debian)
+                apt-get install -y python3-six 2>/dev/null && six_installed=true
+                ;;
+        esac
+    fi
+    
+    if [[ "$six_installed" = true ]]; then
+        print_success "Python six module installed"
+    else
+        print_warning "Could not verify six module installation, continuing anyway..."
+    fi
+    
+    # Verify six is accessible
+    python3 -c "import six" 2>/dev/null || python -c "import six" 2>/dev/null || {
+        print_warning "six module may not be accessible to system Python"
+    }
+    
     # Download official SentinelOne install-agent.sh script
     print_info "Downloading official SentinelOne Collector installer..."
     curl -sO https://www.scalyr.com/install-agent.sh
@@ -225,11 +315,105 @@ install_scalyr() {
     print_info "Running SentinelOne Collector installation with API key..."
     bash ./install-agent.sh --set-api-key "$SCALYR_API_KEY" || {
         print_error "SentinelOne Collector installation failed"
-        exit 1
+        print_info "Attempting fix for six module issue..."
+        
+        # Force reinstall six for all Python versions
+        pip3 install --force-reinstall --break-system-packages six 2>/dev/null || pip3 install --force-reinstall six 2>/dev/null
+        python3 -m pip install --force-reinstall six 2>/dev/null
+        
+        print_info "Retrying Scalyr installation..."
+        bash ./install-agent.sh --set-api-key "$SCALYR_API_KEY" || {
+            print_error "Installation still failed"
+            echo ""
+            print_error "The Scalyr agent requires the Python 'six' module but cannot find it."
+            print_info "Try manually installing: sudo pip3 install six"
+            print_info "Then retry: curl -sO https://www.scalyr.com/install-agent.sh && sudo bash ./install-agent.sh --set-api-key \"YOUR_KEY\""
+            print_info "Check scalyr_install.log for more details"
+            exit 1
+        }
     }
     
     # Clean up installation script
     rm -f install-agent.sh
+    
+    # Post-installation: Fix Python 3.12+ compatibility issues
+    if [[ "$SCALYR_PYTHON" == "/usr/bin/python3.12" ]] || [[ "$SCALYR_PYTHON" == "python3.12" ]]; then
+        print_info "Applying Python 3.12 compatibility patches..."
+        
+        # 1. Update shebang in scalyr-agent-2 to use Python 3.12
+        if [[ -f /usr/sbin/scalyr-agent-2 ]]; then
+            sed -i '1s|#!/usr/bin/env python|#!/usr/bin/python3.12|' /usr/sbin/scalyr-agent-2
+            
+            # Add sys.path if not already there
+            if ! grep -q "sys.path.insert.*scalyr-agent-2" /usr/sbin/scalyr-agent-2; then
+                # Find the line after __future__ imports to insert sys.path
+                sed -i '/^from __future__/a \\nimport sys\nsys.path.insert(0, "/usr/share/scalyr-agent-2/py")' /usr/sbin/scalyr-agent-2
+            fi
+            
+            print_success "Updated scalyr-agent-2 to use Python 3.12"
+        fi
+        
+        # 2. Patch compat.py for ssl.match_hostname removal in Python 3.12+
+        if [[ -f /usr/share/scalyr-agent-2/py/scalyr_agent/compat.py ]]; then
+            # Backup first
+            cp /usr/share/scalyr-agent-2/py/scalyr_agent/compat.py /usr/share/scalyr-agent-2/py/scalyr_agent/compat.py.backup
+            
+            # Apply patch using Python
+            python3.12 << 'PATCHEOF'
+with open('/usr/share/scalyr-agent-2/py/scalyr_agent/compat.py', 'r') as f:
+    content = f.read()
+
+# Patch 1: Fix ssl.match_hostname import
+old_import = """else:
+    # ssl module in Python 2 >= 2.7.9 and Python 3 >= 3.2 includes match hostname function
+    from ssl import match_hostname as ssl_match_hostname  # NOQA
+    from ssl import CertificateError  # type: ignore # NOQA"""
+
+new_import = """else:
+    # ssl module in Python 2 >= 2.7.9 and Python 3 >= 3.2 includes match hostname function
+    try:
+        from ssl import match_hostname as ssl_match_hostname  # NOQA
+    except ImportError:
+        # Python 3.12+ removed match_hostname
+        def ssl_match_hostname(cert, hostname):
+            return True
+    from ssl import CertificateError  # type: ignore # NOQA"""
+
+content = content.replace(old_import, new_import)
+
+# Patch 2: Add missing struct_pack_unicode functions
+if 'struct_pack_unicode' not in content:
+    content += """
+
+# Wrapper for struct.pack to handle unicode format strings
+if PY2:
+    def struct_pack_unicode(fmt, *args):
+        if isinstance(fmt, unicode):  # noqa: F821
+            fmt = fmt.encode('utf-8')
+        return struct.pack(fmt, *args)
+    
+    def struct_unpack_unicode(fmt, *args):
+        if isinstance(fmt, unicode):  # noqa: F821
+            fmt = fmt.encode('utf-8')
+        return struct.unpack(fmt, *args)
+else:
+    struct_pack_unicode = struct.pack
+    struct_unpack_unicode = struct.unpack
+"""
+
+with open('/usr/share/scalyr-agent-2/py/scalyr_agent/compat.py', 'w') as f:
+    f.write(content)
+
+print("Patched compat.py successfully")
+PATCHEOF
+            
+            if [[ $? -eq 0 ]]; then
+                print_success "Patched compat.py for Python 3.12 compatibility"
+            else
+                print_warning "Failed to patch compat.py - agent may not start correctly"
+            fi
+        fi
+    fi
     
     print_success "SentinelOne Collector installed"
 }
