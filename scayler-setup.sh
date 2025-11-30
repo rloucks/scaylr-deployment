@@ -169,14 +169,14 @@ install_dependencies() {
     
     case $OS_TYPE in
         arch)
-            pacman -Sy --noconfirm --needed wget curl acl python python-pip
+            pacman -Sy --noconfirm --needed wget curl acl sudo
             ;;
         fedora|rhel)
-            $PACKAGE_MANAGER install -y wget curl acl python3 python3-pip
+            $PACKAGE_MANAGER install -y wget curl acl sudo
             ;;
         ubuntu|debian)
             apt-get update
-            apt-get install -y wget curl acl python3 python3-pip
+            apt-get install -y wget curl acl sudo
             ;;
     esac
     
@@ -305,7 +305,7 @@ configure_scalyr() {
     print_info "Configuring SentinelOne Collector..."
     
     # The API key was already set during installation with --set-api-key
-    # Now we need to set the scalyr-server URL
+    # Now we need to set the scalyr-server URL using the official command
     
     if [[ -z "$SCALYR_SERVER_URL" ]]; then
         print_error "SentinelOne server URL must be set"
@@ -320,99 +320,86 @@ configure_scalyr() {
     
     print_success "Server URL configured: $SCALYR_SERVER_URL"
     
+    # Set custom serverHost attribute if different from system hostname
+    print_info "Setting server hostname attribute..."
+    scalyr-agent-2-config --set-server-attribute serverHost "$(hostname)"
+    
     # Backup existing config
     if [[ -f "$SCALYR_CONFIG" ]]; then
         cp "$SCALYR_CONFIG" "${SCALYR_CONFIG}.backup.$(date +%Y%m%d%H%M%S)"
         print_info "Backed up existing configuration"
     fi
     
-    # Add log file monitoring configuration using Python
+    # Add log file monitoring using a clean approach
+    # Instead of modifying JSON with Python, we'll add a separate config file
     print_info "Configuring log file monitoring..."
     
-    python3 -c "
-import json
-import os
-
-config_file = '$SCALYR_CONFIG'
-if os.path.exists(config_file):
-    with open(config_file, 'r') as f:
-        content = f.read()
-        # Remove comments for parsing
-        lines = []
-        for line in content.split('\n'):
-            # Keep line if it doesn't start with //
-            stripped = line.strip()
-            if not stripped.startswith('//'):
-                lines.append(line)
-        clean_content = '\n'.join(lines)
-        try:
-            config = json.loads(clean_content)
-        except:
-            config = {}
-else:
-    config = {}
-
-# Ensure server_attributes exists
-if 'server_attributes' not in config:
-    config['server_attributes'] = {}
-if 'serverHost' not in config['server_attributes']:
-    config['server_attributes']['serverHost'] = '$(hostname)'
-
-# Add log monitoring
-if 'logs' not in config:
-    config['logs'] = []
-
-# Add common system logs if not already present
-log_paths = [
-    {'path': '/var/log/messages*', 'attributes': {'parser': 'systemLog'}},
-    {'path': '/var/log/syslog*', 'attributes': {'parser': 'systemLog'}},
-    {'path': '/var/log/secure*', 'attributes': {'parser': 'systemLog'}},
-    {'path': '/var/log/auth.log*', 'attributes': {'parser': 'systemLog'}}
-]
-
-existing_paths = [log.get('path') for log in config['logs']]
-for log_path in log_paths:
-    if log_path['path'] not in existing_paths:
-        config['logs'].append(log_path)
-
-# Write back to file with proper JSON formatting
-with open(config_file, 'w') as f:
-    json.dump(config, f, indent=2)
+    local logs_config="/etc/scalyr-agent-2/agent.d/logs.json"
+    mkdir -p "$(dirname "$logs_config")"
     
-print('Log monitoring configured')
-" 2>/dev/null || {
-        print_warning "Python configuration update failed, logs may need manual configuration"
-    }
+    # Determine which log files actually exist on this system
+    local log_paths=()
     
-    # Set proper permissions on config files
+    # Check for common log files
+    [[ -e /var/log/messages ]] && log_paths+=('{"path": "/var/log/messages*", "attributes": {"parser": "systemLog"}}')
+    [[ -e /var/log/syslog ]] && log_paths+=('{"path": "/var/log/syslog*", "attributes": {"parser": "systemLog"}}')
+    [[ -e /var/log/secure ]] && log_paths+=('{"path": "/var/log/secure*", "attributes": {"parser": "systemLog"}}')
+    [[ -e /var/log/auth.log ]] && log_paths+=('{"path": "/var/log/auth.log*", "attributes": {"parser": "systemLog"}}')
+    
+    # Create the logs configuration file if we found any logs
+    if [[ ${#log_paths[@]} -gt 0 ]]; then
+        cat > "$logs_config" <<EOF
+{
+  "logs": [
+EOF
+        
+        # Add each log path
+        local first=true
+        for log_path in "${log_paths[@]}"; do
+            if [[ "$first" == true ]]; then
+                echo "    $log_path" >> "$logs_config"
+                first=false
+            else
+                echo "    ,$log_path" >> "$logs_config"
+            fi
+        done
+        
+        cat >> "$logs_config" <<EOF
+  ]
+}
+EOF
+        
+        print_success "Configured ${#log_paths[@]} log file(s) for monitoring"
+    else
+        print_warning "No standard log files found. You may need to configure log paths manually."
+    fi
+    
+    # Set proper permissions on all config files
     if [[ -f "$SCALYR_CONFIG" ]]; then
-        chown "$USERNAME":"$USERNAME" "$SCALYR_CONFIG" 2>/dev/null || chown "$USERNAME" "$SCALYR_CONFIG"
         chmod 640 "$SCALYR_CONFIG"
+        chown scalyr:scalyr "$SCALYR_CONFIG" 2>/dev/null || chown scalyr "$SCALYR_CONFIG"
+    fi
+    
+    if [[ -f "$logs_config" ]]; then
+        chmod 640 "$logs_config"
+        chown scalyr:scalyr "$logs_config" 2>/dev/null || chown scalyr "$logs_config"
     fi
     
     # Set permissions on config directory
     if [[ -d "$(dirname "$SCALYR_CONFIG")" ]]; then
-        chown -R "$USERNAME":"$USERNAME" "$(dirname "$SCALYR_CONFIG")" 2>/dev/null || chown -R "$USERNAME" "$(dirname "$SCALYR_CONFIG")"
+        chown -R scalyr:scalyr "$(dirname "$SCALYR_CONFIG")" 2>/dev/null || chown -R scalyr "$(dirname "$SCALYR_CONFIG")"
     fi
     
-    # Configure agent to run as specified user in agent.d directory
-    local agent_d_dir="/etc/scalyr-agent-2/agent.d"
-    mkdir -p "$agent_d_dir"
-    
-    cat > "$agent_d_dir/user.json" <<EOF
-{
-  "user": "$USERNAME"
-}
-EOF
-    
-    chown -R "$USERNAME":"$USERNAME" "$agent_d_dir" 2>/dev/null || chown -R "$USERNAME" "$agent_d_dir"
+    # Remove any problematic config files that might have been created
+    rm -f /etc/scalyr-agent-2/agent.d/scalyr_server.json 2>/dev/null
+    rm -f /etc/scalyr-agent-2/agent.d/user.json 2>/dev/null
     
     print_success "SentinelOne Collector configuration complete"
 }
 
 # Function to harden Scalyr installation
 harden_scalyr() {
-    print_header "Hardening Scalyr Installation"
+    print_header "Hardening SentinelOne Collector Installation"
     
     local config_dir="$(dirname "$SCALYR_CONFIG")"
     local data_dir="/var/lib/scalyr-agent-2"
@@ -421,7 +408,7 @@ harden_scalyr() {
     # 1. Restrict file permissions
     print_info "Setting restrictive file permissions..."
     chmod 750 "$config_dir"
-    chmod 640 "$SCALYR_CONFIG"
+    chmod 640 "$SCALYR_CONFIG" 2>/dev/null
     
     if [[ -d "$data_dir" ]]; then
         chown -R "$USERNAME":"$USERNAME" "$data_dir" 2>/dev/null || chown -R "$USERNAME" "$data_dir"
@@ -435,17 +422,16 @@ harden_scalyr() {
         print_success "Secured log directory"
     fi
     
-    # 2. Configure systemd service hardening
-    print_info "Hardening systemd service..."
-    local service_file="/etc/systemd/system/$SCALYR_SERVICE.service.d/hardening.conf"
-    mkdir -p "$(dirname "$service_file")"
-    
-    cat > "$service_file" <<EOF
+    # 2. Configure systemd service hardening (only if systemd is available)
+    if command -v systemctl &>/dev/null; then
+        print_info "Hardening systemd service..."
+        local service_override_dir="/etc/systemd/system/$SCALYR_SERVICE.service.d"
+        mkdir -p "$service_override_dir"
+        
+        # Only create override if it doesn't conflict with existing service
+        if systemctl cat "$SCALYR_SERVICE" &>/dev/null; then
+            cat > "$service_override_dir/hardening.conf" <<'EOF'
 [Service]
-# Run as non-root user
-User=$USERNAME
-Group=$USERNAME
-
 # Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
@@ -454,21 +440,13 @@ ProtectHome=true
 ReadWritePaths=/var/lib/scalyr-agent-2 /var/log/scalyr-agent-2
 ReadOnlyPaths=/var/log
 
-# Network restrictions
-RestrictAddressFamilies=AF_INET AF_INET6
-IPAddressDeny=any
-IPAddressAllow=localhost
-IPAddressAllow=10.0.0.0/8
-IPAddressAllow=172.16.0.0/12
-IPAddressAllow=192.168.0.0/16
-
 # Capability restrictions
 CapabilityBoundingSet=
 AmbientCapabilities=
 
 # System call filtering
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources @mount
+SystemCallFilter=~@privileged @mount
 
 # Device access
 DevicePolicy=closed
@@ -494,21 +472,19 @@ RestrictSUIDSGID=true
 RemoveIPC=true
 PrivateMounts=true
 EOF
-    
-    systemctl daemon-reload
-    print_success "Systemd service hardened"
-    
-    # 3. Configure AppArmor/SELinux if available
-    if command -v aa-status &>/dev/null; then
-        print_info "AppArmor detected - consider creating a profile"
-        print_warning "AppArmor profile creation requires manual configuration"
+            
+            systemctl daemon-reload
+            print_success "Systemd service hardened"
+        else
+            print_warning "Systemd service not found, skipping service hardening"
+        fi
     fi
     
+    # 3. Configure SELinux if available
     if command -v getenforce &>/dev/null; then
         if [[ "$(getenforce)" != "Disabled" ]]; then
             print_info "SELinux detected - configuring contexts..."
             
-            # Set SELinux contexts
             if command -v semanage &>/dev/null && command -v restorecon &>/dev/null; then
                 semanage fcontext -a -t var_log_t "$log_dir(/.*)?" 2>/dev/null || true
                 semanage fcontext -a -t etc_t "$config_dir(/.*)?" 2>/dev/null || true
@@ -536,27 +512,12 @@ $log_dir/*.log {
 EOF
     print_success "Log rotation configured"
     
-    # 5. Restrict network access (firewall)
-    print_info "Configuring firewall rules..."
-    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
-        # Allow only outbound HTTPS to Scalyr
-        firewall-cmd --permanent --direct --add-rule ipv4 filter OUTPUT 0 -m owner --uid-owner $(id -u "$USERNAME") -p tcp --dport 443 -j ACCEPT 2>/dev/null || true
-        firewall-cmd --reload 2>/dev/null || true
-        print_success "Firewall rules configured"
-    elif command -v ufw &>/dev/null; then
-        # UFW on Ubuntu/Debian
-        ufw allow out from any to any port 443 proto tcp 2>/dev/null || true
-        print_success "UFW rules configured"
-    else
-        print_warning "No supported firewall detected, skipping firewall configuration"
-    fi
-    
-    # 6. Audit logging
+    # 5. Audit logging if available
     if [[ -f /etc/audit/rules.d/audit.rules ]] || [[ -f /etc/audit/audit.rules ]]; then
         print_info "Configuring audit rules..."
         local audit_rules_file="/etc/audit/rules.d/scalyr.rules"
         cat > "$audit_rules_file" <<EOF
-# Monitor Scalyr configuration changes
+# Monitor SentinelOne Collector configuration changes
 -w $SCALYR_CONFIG -p wa -k scalyr_config
 -w $config_dir -p wa -k scalyr_config
 -w $data_dir -p wa -k scalyr_data
@@ -720,11 +681,15 @@ main() {
         read -p "SentinelOne server URL: " SCALYR_SERVER_URL
     done
     
-    # Validate URL format
+    # Validate and clean URL format
     if [[ ! "$SCALYR_SERVER_URL" =~ ^https:// ]]; then
         print_warning "URL should start with https://"
         SCALYR_SERVER_URL="https://$SCALYR_SERVER_URL"
     fi
+    
+    # Remove trailing slash if present (causes 404 errors)
+    SCALYR_SERVER_URL="${SCALYR_SERVER_URL%/}"
+    print_info "Using server URL: $SCALYR_SERVER_URL"
     
     # Confirmation
     echo ""
