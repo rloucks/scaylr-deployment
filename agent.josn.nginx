@@ -1,0 +1,145 @@
+  "logs": [
+    // System logs
+    {
+      "path": "/var/log/auth.log*",
+      "attributes": {"parser": "systemLog"}
+    },
+    {
+      "path": "/var/log/syslog*",
+      "attributes": {"parser": "systemLog"}
+    },
+    
+    // Nginx access logs
+    {
+      "path": "/var/log/nginx/access.log",
+      "attributes": {
+        "parser": "accessLog",
+        "logtype": "nginx-access"
+      }
+    },
+    
+    // Nginx error logs
+    {
+      "path": "/var/log/nginx/error.log",
+      "attributes": {
+        "parser": "nginxErrorLog",
+        "logtype": "nginx-error"
+      }
+    },
+    
+    // SSL/TLS access logs (if you have HTTPS)
+    {
+      "path": "/var/log/nginx/ssl-access.log",
+      "attributes": {
+        "parser": "accessLog",
+        "logtype": "nginx-ssl-access"
+      }
+    },
+    
+    // Virtual host specific logs (add for each vhost)
+    {
+      "path": "/var/log/nginx/example.com-access.log",
+      "attributes": {
+        "parser": "accessLog",
+        "vhost": "example.com"
+      }
+    },
+    {
+      "path": "/var/log/nginx/example.com-error.log",
+      "attributes": {
+        "parser": "nginxErrorLog",
+        "vhost": "example.com"
+      }
+    },
+    
+    // PHP-FPM logs (if using PHP)
+    {
+      "path": "/var/log/php*-fpm/error.log",
+      "attributes": {
+        "parser": "phpFpmLog",
+        "app": "php-fpm"
+      }
+    },
+    {
+      "path": "/var/log/php*-fpm/www-error.log",
+      "attributes": {
+        "parser": "phpFpmLog",
+        "app": "php-fpm"
+      }
+    },
+    
+    // Application logs (adjust paths as needed)
+    {
+      "path": "/var/www/*/logs/*.log",
+      "attributes": {
+        "parser": "json",
+        "app": "webapp"
+      }
+    },
+    
+    // SSL certificate monitoring
+    {
+      "path": "/var/log/letsencrypt/letsencrypt.log",
+      "attributes": {
+        "parser": "systemLog",
+        "app": "certbot"
+      }
+    }
+  ],
+  
+  "monitors": [
+    // System metrics (CPU, memory, disk, network)
+    {
+      "module": "scalyr_agent.builtin_monitors.linux_system_metrics",
+      "id": "system"
+    },
+    
+    // Nginx process monitoring
+    {
+      "module": "scalyr_agent.builtin_monitors.linux_process_metrics",
+      "id": "nginx",
+      "commandline": "nginx"
+    },
+    
+    // PHP-FPM process monitoring (if using PHP)
+    {
+      "module": "scalyr_agent.builtin_monitors.linux_process_metrics",
+      "id": "php-fpm",
+      "commandline": "php-fpm"
+    },
+    
+    // Nginx status monitoring (requires nginx status page enabled)
+    {
+      "module": "scalyr_agent.builtin_monitors.nginx_monitor",
+      "status_url": "http://localhost/nginx_status"
+    },
+    
+    // URL monitoring - check if your site is up
+    {
+      "module": "scalyr_agent.builtin_monitors.url_monitor",
+      "id": "website-health",
+      "url": "https://example.com/health",
+      "extract_fields": "status_code"
+    },
+    
+    // MySQL monitoring (if you have a database)
+    {
+      "module": "scalyr_agent.builtin_monitors.mysql_monitor",
+      "database_socket": "/var/run/mysqld/mysqld.sock",
+      "database_username": "scalyr_monitor",
+      "database_password": "CHANGE_ME"
+    },
+    
+    // Redis monitoring (if using Redis)
+    {
+      "module": "scalyr_agent.builtin_monitors.redis_monitor",
+      "redis_host": "localhost",
+      "redis_port": 6379
+    },
+    
+    // Docker monitoring (if running containers)
+    {
+      "module": "scalyr_agent.builtin_monitors.docker_monitor",
+      "container_name_include_globs": ["nginx-*", "app-*"]
+    }
+  ]
